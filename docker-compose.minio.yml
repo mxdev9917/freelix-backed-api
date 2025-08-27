@@ -1,0 +1,23 @@
+version: "3.8"
+
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: freelix.com.la
+      MINIO_ROOT_PASSWORD: 10kFOHSc5azKgrUX5e2PnUysRwz5QJqUIivf7cnLrUqY0OmeiY
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+volumes:
+  minio-data:

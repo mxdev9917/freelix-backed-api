@@ -1,0 +1,84 @@
+version: '3.8'
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: mysql-prod
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: StrongRootPass123!
+      MYSQL_DATABASE: production_db
+      MYSQL_USER: app_user
+      MYSQL_PASSWORD: StrongAppPass456!
+    ports:
+      - "3306:3306"
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --default-authentication-plugin=mysql_native_password
+    volumes:
+      - etest_mysql_data:/var/lib/mysql
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - backend
+
+  backend:
+    image: freelixlaos/freelix-backend:2.2.3
+    container_name: freelix-backend
+    restart: unless-stopped
+    depends_on:
+      - mysql
+    ports:
+      - "3001:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DB_HOST_WRITE: mysql-prod
+      DB_PORT_WRITE: 3306
+      DB_USER_WRITE: app_write
+      DB_PASSWORD_WRITE: StrongAppPass456!
+      DB_DATABASE_WRITE: production_db
+      DB_CONNECTTIMEOUT_WRITE: 10000
+      DB_HOST_READ: mysql-prod
+      DB_PORT_READ: 3306
+      DB_USER_READ: app_read
+      DB_PASSWORD_READ: StrongAppPass456!
+      DB_DATABASE_READ: production_db
+      DB_CONNECTTIMEOUT_READ: 10000
+      PROJECT_TAG: freelix.com.la
+      JWT_SECRET_ADMIN: admin
+      JWT_SECRET_APP: app
+      NODE_OPTIONS: --max-old-space-size=1024
+      UV_THREADPOOL_SIZE: 16
+      SWAGGER_USER: admin
+      SWAGGER_PASSWORD: 2wsx@WSX
+      DEFAULT_PATH: avatar.jpg
+
+      # MinIO ENV
+      MINIO_ENDPOINT: storage.freelix.com.la
+      MINIO_PORT: 9000
+      MINIO_USE_SSL: false
+      MINIO_ACCESS_KEY: freelix.com.la
+      MINIO_SECRET_KEY: 10kFOHSc5azKgrUX5e2PnUysRwz5QJqUIivf7cnLrUqY0OmeiY
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - backend
+
+volumes:
+  etest_mysql_data:
+
+networks:
+  backend:
+    driver: bridge
