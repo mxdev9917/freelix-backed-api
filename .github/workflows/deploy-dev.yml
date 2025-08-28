@@ -7,7 +7,7 @@ on:
 
 env:
   IMAGE_NAME: freelixlaos/freelix-backend   # Docker Hub repo
-  DEPLOY_PATH: /opt/freelix-backend         # folder on server that already has your docker-compose.yml
+  DEPLOY_PATH: /opt/freelix-backend         # server folder that already has docker-compose.yml
   SERVICE_NAME: freelix-backend             # compose service/container name for backend
 
 jobs:
@@ -16,7 +16,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-
     outputs:
       VERSION: ${{ steps.pkg.outputs.VERSION }}
       IMAGE_TAG: ${{ steps.pkg.outputs.IMAGE_TAG }}
@@ -25,15 +24,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Read version safely (doesn't crash if package.json is missing)
-      - name: Read version (fallbacks to latest)
+      - name: Set up Node (for reading package.json)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Read version (fallback to latest)
         id: pkg
         shell: bash
         run: |
           set -euo pipefail
           VERSION=""
           if [ -f package.json ]; then
-            VERSION=$(node -e "try{console.log(require('./package.json').version||'')}catch(e){console.log('')}" )
+            VERSION=$(node -e "try{console.log(require('./package.json').version||'')}catch(e){console.log('')}")
           fi
           if [ -z "$VERSION" ]; then
             VERSION="latest"
@@ -76,23 +79,22 @@ jobs:
     needs: build-and-push
     runs-on: ubuntu-latest
 
-    env:
-      IMAGE_NAME: ${{ env.IMAGE_NAME }}
-      IMAGE_TAG: ${{ needs.build-and-push.outputs.IMAGE_TAG }}
-      DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
-      SERVICE_NAME: ${{ env.SERVICE_NAME }}
-
     steps:
       - name: Deploy via SSH (sudo)
         uses: appleboy/ssh-action@v1.2.0
+        env:
+          # dynamic from previous job
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.IMAGE_TAG }}
+          # workflow-level env (IMAGE_NAME, DEPLOY_PATH, SERVICE_NAME) are available here
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           password: ${{ secrets.SSH_PASSWORD }}
-          # use default 22 if not provided
-          port: ${{ secrets.SSH_PORT && secrets.SSH_PORT || 22 }}
+          # omit port -> defaults to 22; add `port: ${{ secrets.SSH_PORT }}` if you set it
           timeout: 60s
           command_timeout: 20m
+          # pass env vars to the remote shell
+          envs: IMAGE_NAME,IMAGE_TAG,DEPLOY_PATH,SERVICE_NAME
           script: |
             set -euo pipefail
 
@@ -106,17 +108,17 @@ jobs:
             echo "Login Docker Hub..."
             echo "${{ secrets.DOCKERHUB_TOKEN }}" | sudo docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
 
-            sudo mkdir -p "${DEPLOY_PATH}"
-            cd "${DEPLOY_PATH}"
+            sudo mkdir -p "$DEPLOY_PATH"
+            cd "$DEPLOY_PATH"
 
             if [ ! -f docker-compose.yml ]; then
-              echo "docker-compose.yml not found in ${DEPLOY_PATH} — aborting."; exit 1
+              echo "docker-compose.yml not found in $DEPLOY_PATH — aborting."; exit 1
             fi
 
             echo "Current compose services:"
             sudo docker compose config --services || true
 
-            # OPTIONAL: ensure backend network exists
+            # ensure backend network exists (optional)
             sudo docker network inspect backend >/dev/null 2>&1 || sudo docker network create backend
 
             # Update ONLY backend image line
@@ -128,7 +130,6 @@ jobs:
             echo "Pull the new backend image..."
             sudo docker pull "${IMAGE_NAME}:${IMAGE_TAG}"
 
-            # Wait for mysql healthy (best-effort)
             echo "Waiting for MySQL healthy (max ~90s)..."
             ATTEMPTS=0
             until [ "$(sudo docker inspect --format='{{json .State.Health.Status}}' mysql-prod 2>/dev/null | tr -d '\"')" = "healthy" ] || [ $ATTEMPTS -ge 9 ]; do
@@ -137,8 +138,8 @@ jobs:
             done
 
             echo "Recreate only backend with the new image..."
-            sudo docker compose pull ${SERVICE_NAME}
-            sudo docker compose up -d ${SERVICE_NAME}
+            sudo docker compose pull "${SERVICE_NAME}"
+            sudo docker compose up -d "${SERVICE_NAME}"
 
             echo "Prune dangling images..."
             sudo docker image prune -f
@@ -148,4 +149,4 @@ jobs:
             sudo docker compose ps || true
 
             echo "Recent backend logs (30 lines):"
-            sudo docker logs --tail=30 ${SERVICE_NAME} || true
+            sudo docker logs --tail=30 "${SERVICE_NAME}" || true
