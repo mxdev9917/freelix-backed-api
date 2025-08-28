@@ -27,7 +27,7 @@ git checkout main
 git pull origin main
 
 # 3. Merge the 'backend-eh' branch into 'main'
-git merge dev
+git merge main
 
 # 4. Push the merged changes to GitHub
 git push origin main
