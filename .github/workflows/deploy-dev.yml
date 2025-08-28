@@ -87,14 +87,13 @@ jobs:
           echo "::error::Missing required secrets. Set SSH_HOST, SSH_USER, SSH_PASSWORD, DOCKERHUB_USERNAME, DOCKERHUB_TOKEN."
           exit 1
 
-      - name: Deploy via SSH (non-interactive sudo)
+      - name: Deploy via SSH (non-interactive sudo using SSH password)
         uses: appleboy/ssh-action@v1.2.0
         env:
           IMAGE_TAG: ${{ needs.build-and-push.outputs.IMAGE_TAG }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}      # fallback for sudo if SUDO_PASSWORD not set
-          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}    # optional: prefer this for sudo
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}  # used for sudo as well
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
@@ -103,23 +102,24 @@ jobs:
           timeout: 60s
           command_timeout: 20m
           # Pass env vars to the remote session
-          envs: IMAGE_NAME,IMAGE_TAG,DEPLOY_PATH,SERVICE_NAME,DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,SSH_PASSWORD,SUDO_PASSWORD
+          envs: IMAGE_NAME,IMAGE_TAG,DEPLOY_PATH,SERVICE_NAME,DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,SSH_PASSWORD
           script: |
             set -euo pipefail
 
-            SUDO_PASS="${SUDO_PASSWORD:-$SSH_PASSWORD}"
+            # Use SSH password for sudo
+            SUDO_PASS="$SSH_PASSWORD"
 
             # Define a helper that runs commands with sudo if needed (non-interactively)
             if [ "$(id -u)" -eq 0 ]; then
               sudo_cmd() { "$@"; }
             else
               if [ -z "${SUDO_PASS:-}" ]; then
-                echo "::error::This user requires sudo but no sudo password provided. Set SUDO_PASSWORD or use a root SSH user or add user to docker group."
+                echo "::error::This user requires sudo but no password provided."
                 exit 1
               fi
               # Validate sudo and keep it alive briefly
-              echo "$SUDO_PASS" | sudo -S -v
-              sudo_cmd() { echo "$SUDO_PASS" | sudo -S "$@"; }
+              printf "%s\n" "$SUDO_PASS" | sudo -S -v
+              sudo_cmd() { printf "%s\n" "$SUDO_PASS" | sudo -S "$@"; }
             fi
 
             # Basic checks
