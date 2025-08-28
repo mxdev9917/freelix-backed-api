@@ -80,49 +80,62 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Deploy via SSH (password) - compose-aware with sudo fallback
+      - name: Deploy via SSH (password) - compose-aware with sudo/FS sudo fallback
         uses: appleboy/ssh-action@v1.2.0
         env:
           IMAGE_TAG: ${{ needs.build-and-push.outputs.IMAGE_TAG }}
-          # IMAGE_NAME, DEPLOY_PATH, SERVICE_NAME มาจาก workflow-level env (หัวไฟล์)
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}            # ใช้ prime sudo
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          # IMAGE_NAME, DEPLOY_PATH, SERVICE_NAME มาจาก env ด้านบน
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           password: ${{ secrets.SSH_PASSWORD }}
-          # ถ้ามีพอร์ตที่ไม่ใช่ 22 ให้ตั้ง secret SSH_PORT แล้ว uncomment บรรทัดนี้
+          # ถ้าใช้พอร์ตไม่ใช่ 22 ให้สร้าง SSH_PORT แล้วค่อย uncomment
           port: ${{ secrets.SSH_PORT }}
           timeout: 60s
           command_timeout: 20m
-          # ส่ง env เหล่านี้เข้า session บนเครื่องปลายทาง
-          envs: IMAGE_NAME,IMAGE_TAG,DEPLOY_PATH,SERVICE_NAME
+          envs: IMAGE_NAME,IMAGE_TAG,DEPLOY_PATH,SERVICE_NAME,SSH_PASSWORD,DOCKERHUB_USERNAME,DOCKERHUB_TOKEN
           script: |
             set -euo pipefail
 
-            # เลือกใช้ sudo แบบโค้ดเก่า: ถ้า docker ใช้ได้โดยไม่ต้อง sudo ก็ไม่ใช้
+            # ---------- Decide SUDO for Docker ----------
             if docker info >/dev/null 2>&1; then
               echo "Docker accessible without sudo."
               SUDO=""
             else
-              echo "Docker requires sudo; priming sudo with -S..."
-              echo "${{ secrets.SSH_PASSWORD }}" | sudo -S -p "" true
+              echo "Docker requires sudo; priming sudo..."
+              printf "%s\n" "$SSH_PASSWORD" | sudo -S -p "" true
               SUDO="sudo"
             fi
 
-            # ตรวจ compose v2
-            if ! $SUDO docker compose version >/dev/null 2>&1; then
-              echo "docker compose v2 not found"; exit 1
+            # ---------- Decide FSUDO for filesystem (/opt needs root) ----------
+            FSUDO=""
+            PARENT_DIR="$(dirname "$DEPLOY_PATH")"
+            # ถ้า dir มีอยู่แล้ว ตรวจสิทธิ์เขียน; ถ้ายังไม่มี ตรวจสิทธิ์ที่ parent
+            if [ -d "$DEPLOY_PATH" ]; then
+              if [ ! -w "$DEPLOY_PATH" ]; then
+                [ -z "$SUDO" ] && printf "%s\n" "$SSH_PASSWORD" | sudo -S -p "" true
+                FSUDO="sudo"
+              fi
+            else
+              if [ ! -w "$PARENT_DIR" ]; then
+                [ -z "$SUDO" ] && printf "%s\n" "$SSH_PASSWORD" | sudo -S -p "" true
+                FSUDO="sudo"
+              fi
             fi
 
-            echo "Login Docker Hub..."
-            # ใช้สไตล์ -p (ไม่อ่านจาก stdin) เพื่อหลีกเลี่ยง TTY issue
-            $SUDO docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" -p "${{ secrets.DOCKERHUB_TOKEN }}"
+            echo "Login Docker Hub (using --password-stdin)..."
+            printf '%s' "$DOCKERHUB_TOKEN" | $SUDO docker login -u "$DOCKERHUB_USERNAME" --password-stdin
 
             echo "Ensure deploy path..."
-            $SUDO mkdir -p "$DEPLOY_PATH"
+            $FSUDO mkdir -p "$DEPLOY_PATH"
 
             echo "Ensure docker-compose.yml exists..."
-            if ! $SUDO test -f "$DEPLOY_PATH/docker-compose.yml"; then
-              echo "docker-compose.yml not found in $DEPLOY_PATH — aborting."; exit 1
+            if ! $FSUDO test -f "$DEPLOY_PATH/docker-compose.yml"; then
+              echo "docker-compose.yml not found in $DEPLOY_PATH — aborting."
+              exit 1
             fi
 
             echo "Current compose services:"
@@ -132,10 +145,10 @@ jobs:
             $SUDO docker network inspect backend >/dev/null 2>&1 || $SUDO docker network create backend
 
             echo "Update only backend image tag inside compose..."
-            $SUDO sed -i -E "s|(^[[:space:]]*image:[[:space:]]*)${IMAGE_NAME}:[[:alnum:]._-]+|\1${IMAGE_NAME}:${IMAGE_TAG}|g" "$DEPLOY_PATH/docker-compose.yml"
+            $FSUDO sed -i -E "s|(^[[:space:]]*image:[[:space:]]*)${IMAGE_NAME}:[[:alnum:]._-]+|\1${IMAGE_NAME}:${IMAGE_TAG}|g" "$DEPLOY_PATH/docker-compose.yml"
 
             echo "Compose diff (context around image):"
-            $SUDO grep -n -A2 -B2 -E "image:.*${IMAGE_NAME}" "$DEPLOY_PATH/docker-compose.yml" || true
+            $FSUDO grep -n -A2 -B2 -E "image:.*${IMAGE_NAME}" "$DEPLOY_PATH/docker-compose.yml" || true
 
             echo "Pull new backend image..."
             $SUDO docker pull "${IMAGE_NAME}:${IMAGE_TAG}"
