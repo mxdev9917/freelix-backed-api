@@ -2,13 +2,13 @@ name: Build, Push, and Deploy (versioned, compose-aware)
 
 on:
   push:
-    branches: [ "develop" ]
+    branches: ["develop"]
   workflow_dispatch:
 
 env:
-  IMAGE_NAME: freelixlaos/freelix-backend         # Docker Hub repo
-  DEPLOY_PATH: /opt/freelix-backend               # folder on server that already has your docker-compose.yml
-  SERVICE_NAME: freelix-backend                   # compose service/container name for backend
+  IMAGE_NAME: freelixlaos/freelix-backend   # Docker Hub repo
+  DEPLOY_PATH: /opt/freelix-backend         # folder on server that already has your docker-compose.yml
+  SERVICE_NAME: freelix-backend             # compose service/container name for backend
 
 jobs:
   build-and-push:
@@ -16,7 +16,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
 
     outputs:
       VERSION: ${{ steps.pkg.outputs.VERSION }}
@@ -26,22 +25,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Node (read package.json)
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Read version from package.json
+      # Read version safely (doesn't crash if package.json is missing)
+      - name: Read version (fallbacks to latest)
         id: pkg
+        shell: bash
         run: |
-          VERSION=$(node -p "require('./package.json').version || ''")
-          if [ -z "$VERSION" ]; then
-            echo "VERSION=latest" >> $GITHUB_OUTPUT
-            echo "IMAGE_TAG=latest" >> $GITHUB_OUTPUT
-          else
-            echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
-            echo "IMAGE_TAG=v$VERSION" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          VERSION=""
+          if [ -f package.json ]; then
+            VERSION=$(node -e "try{console.log(require('./package.json').version||'')}catch(e){console.log('')}" )
           fi
+          if [ -z "$VERSION" ]; then
+            VERSION="latest"
+            IMAGE_TAG="latest"
+          else
+            IMAGE_TAG="v${VERSION}"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved VERSION=$VERSION IMAGE_TAG=$IMAGE_TAG"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -87,13 +89,13 @@ jobs:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           password: ${{ secrets.SSH_PASSWORD }}
-          port: ${{ secrets.SSH_PORT || 1234 }}
+          # use default 22 if not provided
+          port: ${{ secrets.SSH_PORT && secrets.SSH_PORT || 22 }}
           timeout: 60s
           command_timeout: 20m
           script: |
             set -euo pipefail
 
-            # Sanity
             if ! command -v docker >/dev/null 2>&1; then
               echo "docker not found on server"; exit 1
             fi
@@ -104,32 +106,29 @@ jobs:
             echo "Login Docker Hub..."
             echo "${{ secrets.DOCKERHUB_TOKEN }}" | sudo docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
 
-            # Go to deploy folder with your existing compose (contains mysql + backend)
             sudo mkdir -p "${DEPLOY_PATH}"
             cd "${DEPLOY_PATH}"
 
             if [ ! -f docker-compose.yml ]; then
-              echo "docker-compose.yml not found in ${DEPLOY_PATH} — aborting to avoid overwriting your running stack."
-              exit 1
+              echo "docker-compose.yml not found in ${DEPLOY_PATH} — aborting."; exit 1
             fi
 
             echo "Current compose services:"
-            sudo docker compose config --services
+            sudo docker compose config --services || true
 
-            # OPTIONAL: ensure MySQL network is up
+            # OPTIONAL: ensure backend network exists
             sudo docker network inspect backend >/dev/null 2>&1 || sudo docker network create backend
 
-            # Update ONLY the backend image tag inside compose file
-            # This looks for the line under the backend service: image: freelixlaos/freelix-backend:...
+            # Update ONLY backend image line
             sudo sed -i -E "s|(^[[:space:]]*image:[[:space:]]*)${IMAGE_NAME}:[[:alnum:]._-]+|\1${IMAGE_NAME}:${IMAGE_TAG}|g" docker-compose.yml
 
-            echo "Compose diff (context around image):"
+            echo "Compose diff (around image):"
             grep -n -A2 -B2 -E "image:.*${IMAGE_NAME}" docker-compose.yml || true
 
             echo "Pull the new backend image..."
             sudo docker pull "${IMAGE_NAME}:${IMAGE_TAG}"
 
-            # Wait for mysql healthy before touching backend (best-effort)
+            # Wait for mysql healthy (best-effort)
             echo "Waiting for MySQL healthy (max ~90s)..."
             ATTEMPTS=0
             until [ "$(sudo docker inspect --format='{{json .State.Health.Status}}' mysql-prod 2>/dev/null | tr -d '\"')" = "healthy" ] || [ $ATTEMPTS -ge 9 ]; do
@@ -145,8 +144,8 @@ jobs:
             sudo docker image prune -f
 
             echo "Status:"
-            sudo docker ps --filter "name=${SERVICE_NAME}"
-            sudo docker compose ps
+            sudo docker ps --filter "name=${SERVICE_NAME}" || true
+            sudo docker compose ps || true
 
             echo "Recent backend logs (30 lines):"
             sudo docker logs --tail=30 ${SERVICE_NAME} || true
