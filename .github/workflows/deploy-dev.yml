@@ -7,8 +7,8 @@ on:
 
 env:
   IMAGE_NAME: freelixlaos/freelix-backend   # Docker Hub repo
-  DEPLOY_PATH: /opt/freelix-backend         # folder on server with docker-compose.yml
-  SERVICE_NAME: freelix-backend             # compose service/container name
+  DEPLOY_PATH: /opt/freelix-backend         # server folder that already has docker-compose.yml
+  SERVICE_NAME: freelix-backend             # compose service/container name for backend
 
 jobs:
   build-and-push:
@@ -80,98 +80,83 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Validate required secrets
-        if: ${{ secrets.SSH_HOST == '' || secrets.SSH_USER == '' || secrets.SSH_PASSWORD == '' || secrets.DOCKERHUB_USERNAME == '' || secrets.DOCKERHUB_TOKEN == '' }}
-        run: |
-          echo "::error::Missing required secrets. Set SSH_HOST, SSH_USER, SSH_PASSWORD, DOCKERHUB_USERNAME, DOCKERHUB_TOKEN."
-          exit 1
-
-      - name: Deploy via SSH (sudo uses SSH password)
+      - name: Deploy via SSH (password) - compose-aware with sudo fallback
         uses: appleboy/ssh-action@v1.2.0
         env:
           IMAGE_TAG: ${{ needs.build-and-push.outputs.IMAGE_TAG }}
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}  # same password used for sudo
+          # IMAGE_NAME, DEPLOY_PATH, SERVICE_NAME มาจาก workflow-level env (หัวไฟล์)
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           password: ${{ secrets.SSH_PASSWORD }}
-          # port: ${{ secrets.SSH_PORT }}   # uncomment if you use a non-default port
+          # ถ้ามีพอร์ตที่ไม่ใช่ 22 ให้ตั้ง secret SSH_PORT แล้ว uncomment บรรทัดนี้
+          port: ${{ secrets.SSH_PORT }}
           timeout: 60s
           command_timeout: 20m
-          envs: IMAGE_NAME,IMAGE_TAG,DEPLOY_PATH,SERVICE_NAME,DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,SSH_PASSWORD
+          # ส่ง env เหล่านี้เข้า session บนเครื่องปลายทาง
+          envs: IMAGE_NAME,IMAGE_TAG,DEPLOY_PATH,SERVICE_NAME
           script: |
             set -euo pipefail
 
-            # Cache sudo credentials if not root
-            if [ "$(id -u)" -ne 0 ]; then
-              printf "%s\n" "$SSH_PASSWORD" | sudo -S -v
+            # เลือกใช้ sudo แบบโค้ดเก่า: ถ้า docker ใช้ได้โดยไม่ต้อง sudo ก็ไม่ใช้
+            if docker info >/dev/null 2>&1; then
+              echo "Docker accessible without sudo."
+              SUDO=""
+            else
+              echo "Docker requires sudo; priming sudo with -S..."
+              echo "${{ secrets.SSH_PASSWORD }}" | sudo -S -p "" true
+              SUDO="sudo"
             fi
 
-            # Helper to run a command with sudo (uses SSH password)
-            sudorun() {
-              if [ "$(id -u)" -eq 0 ]; then
-                "$@"
-              else
-                printf "%s\n" "$SSH_PASSWORD" | sudo -S "$@"
-              fi
-            }
-
-            # Pre-checks
-            if ! sudorun command -v docker >/dev/null 2>&1; then
-              echo "docker not found on server"; exit 1
-            fi
-            if ! sudorun docker compose version >/dev/null 2>&1; then
+            # ตรวจ compose v2
+            if ! $SUDO docker compose version >/dev/null 2>&1; then
               echo "docker compose v2 not found"; exit 1
             fi
 
-            # Docker Hub login (avoid stdin conflict by using a temp file)
-            TOKEN_FILE="$(mktemp)"
-            chmod 600 "$TOKEN_FILE"
-            printf '%s' "$DOCKERHUB_TOKEN" > "$TOKEN_FILE"
-            sudorun docker login -u "$DOCKERHUB_USERNAME" --password-stdin < "$TOKEN_FILE"
-            rm -f "$TOKEN_FILE"
+            echo "Login Docker Hub..."
+            # ใช้สไตล์ -p (ไม่อ่านจาก stdin) เพื่อหลีกเลี่ยง TTY issue
+            $SUDO docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" -p "${{ secrets.DOCKERHUB_TOKEN }}"
 
-            # Ensure compose folder & file
-            sudorun mkdir -p "$DEPLOY_PATH"
-            if ! sudorun test -f "$DEPLOY_PATH/docker-compose.yml"; then
-              echo "docker-compose.yml not found in $DEPLOY_PATH — aborting."
-              exit 1
+            echo "Ensure deploy path..."
+            $SUDO mkdir -p "$DEPLOY_PATH"
+
+            echo "Ensure docker-compose.yml exists..."
+            if ! $SUDO test -f "$DEPLOY_PATH/docker-compose.yml"; then
+              echo "docker-compose.yml not found in $DEPLOY_PATH — aborting."; exit 1
             fi
 
             echo "Current compose services:"
-            sudorun docker compose -f "$DEPLOY_PATH/docker-compose.yml" config --services || true
+            $SUDO docker compose -f "$DEPLOY_PATH/docker-compose.yml" config --services || true
 
-            # Ensure network exists (optional)
-            sudorun docker network inspect backend >/dev/null 2>&1 || sudorun docker network create backend
+            # OPTIONAL: ensure network exists
+            $SUDO docker network inspect backend >/dev/null 2>&1 || $SUDO docker network create backend
 
-            # Update ONLY backend image line
-            sudorun sed -i -E "s|(^[[:space:]]*image:[[:space:]]*)${IMAGE_NAME}:[[:alnum:]._-]+|\1${IMAGE_NAME}:${IMAGE_TAG}|g" "$DEPLOY_PATH/docker-compose.yml"
+            echo "Update only backend image tag inside compose..."
+            $SUDO sed -i -E "s|(^[[:space:]]*image:[[:space:]]*)${IMAGE_NAME}:[[:alnum:]._-]+|\1${IMAGE_NAME}:${IMAGE_TAG}|g" "$DEPLOY_PATH/docker-compose.yml"
 
-            echo "Compose diff (around image):"
-            sudorun grep -n -A2 -B2 -E "image:.*${IMAGE_NAME}" "$DEPLOY_PATH/docker-compose.yml" || true
+            echo "Compose diff (context around image):"
+            $SUDO grep -n -A2 -B2 -E "image:.*${IMAGE_NAME}" "$DEPLOY_PATH/docker-compose.yml" || true
 
-            echo "Pull the new backend image..."
-            sudorun docker pull "${IMAGE_NAME}:${IMAGE_TAG}"
+            echo "Pull new backend image..."
+            $SUDO docker pull "${IMAGE_NAME}:${IMAGE_TAG}"
 
-            echo "Waiting for MySQL healthy (max ~90s)..."
+            echo "Wait for MySQL healthy (best effort, ~90s max)..."
             ATTEMPTS=0
-            until [ "$(sudorun docker inspect --format='{{json .State.Health.Status}}' mysql-prod 2>/dev/null | tr -d '\"')" = "healthy" ] || [ $ATTEMPTS -ge 9 ]; do
+            until [ "$($SUDO docker inspect --format='{{json .State.Health.Status}}' mysql-prod 2>/dev/null | tr -d '"')" = "healthy" ] || [ $ATTEMPTS -ge 9 ]; do
               ATTEMPTS=$((ATTEMPTS+1))
               sleep 10
             done
 
             echo "Recreate only backend with the new image..."
-            sudorun docker compose -f "$DEPLOY_PATH/docker-compose.yml" pull "${SERVICE_NAME}"
-            sudorun docker compose -f "$DEPLOY_PATH/docker-compose.yml" up -d "${SERVICE_NAME}"
+            $SUDO docker compose -f "$DEPLOY_PATH/docker-compose.yml" pull "${SERVICE_NAME}"
+            $SUDO docker compose -f "$DEPLOY_PATH/docker-compose.yml" up -d "${SERVICE_NAME}"
 
             echo "Prune dangling images..."
-            sudorun docker image prune -f
+            $SUDO docker image prune -f
 
             echo "Status:"
-            sudorun docker ps --filter "name=${SERVICE_NAME}" || true
-            sudorun docker compose -f "$DEPLOY_PATH/docker-compose.yml" ps || true
+            $SUDO docker ps --filter "name=${SERVICE_NAME}" || true
+            $SUDO docker compose -f "$DEPLOY_PATH/docker-compose.yml" ps || true
 
             echo "Recent backend logs (30 lines):"
-            sudorun docker logs --tail=30 "${SERVICE_NAME}" || true
+            $SUDO docker logs --tail=30 "${SERVICE_NAME}" || true
