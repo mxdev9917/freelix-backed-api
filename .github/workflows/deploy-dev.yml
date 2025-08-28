@@ -80,73 +80,124 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Deploy via SSH (sudo)
+      # Fail early if essential secrets are missing
+      - name: Validate required secrets
+        if: ${{ secrets.SSH_HOST == '' || secrets.SSH_USER == '' || secrets.SSH_PASSWORD == '' || secrets.DOCKERHUB_USERNAME == '' || secrets.DOCKERHUB_TOKEN == '' }}
+        run: |
+          echo "::error::Missing required secrets. Set SSH_HOST, SSH_USER, SSH_PASSWORD, DOCKERHUB_USERNAME, DOCKERHUB_TOKEN."
+          exit 1
+
+      - name: Deploy via SSH (handles sudo without TTY)
         uses: appleboy/ssh-action@v1.2.0
         env:
-          # dynamic from previous job
           IMAGE_TAG: ${{ needs.build-and-push.outputs.IMAGE_TAG }}
-          # workflow-level env (IMAGE_NAME, DEPLOY_PATH, SERVICE_NAME) are available here
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}         # used as fallback for sudo
+          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}       # optional; if unset, SSH_PASSWORD is used
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           password: ${{ secrets.SSH_PASSWORD }}
-          port: ${{ secrets.SSH_PORT }}
+          # Uncomment if you use a non-default SSH port:
+          # port: ${{ secrets.SSH_PORT }}
           timeout: 60s
           command_timeout: 20m
-          # pass env vars to the remote shell
-          envs: IMAGE_NAME,IMAGE_TAG,DEPLOY_PATH,SERVICE_NAME
+          # Pass env vars into the remote shell
+          envs: IMAGE_NAME,IMAGE_TAG,DEPLOY_PATH,SERVICE_NAME,DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,SSH_PASSWORD,SUDO_PASSWORD
           script: |
             set -euo pipefail
 
-            if ! command -v docker >/dev/null 2>&1; then
-              echo "docker not found on server"; exit 1
+            # Choose a sudo password: prefer SUDO_PASSWORD, else SSH_PASSWORD
+            SUDO_PASS="${SUDO_PASSWORD:-$SSH_PASSWORD}"
+
+            # If we're root, no sudo needed; otherwise require a password for sudo -S
+            if [ "$(id -u)" -eq 0 ]; then
+              echo "[INFO] Running as root on remote host."
+              ROOT_PREFIX=""
+            else
+              if [ -z "${SUDO_PASS:-}" ]; then
+                echo "::error::This user requires sudo but no sudo password was provided. Set secret SUDO_PASSWORD or run as root / add user to docker group."
+                exit 1
+              fi
+              echo "[INFO] Authenticating sudo..."
+              echo "$SUDO_PASS" | sudo -S -v
+              ROOT_PREFIX="sudo -S"
             fi
-            if ! docker compose version >/dev/null 2>&1; then
-              echo "docker compose v2 not found"; exit 1
-            fi
 
-            echo "Login Docker Hub..."
-            echo "${{ secrets.DOCKERHUB_TOKEN }}" | sudo docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+            # Helper to run a whole privileged block (either with sudo or directly)
+            run_root_block() {
+              # shellcheck disable=SC2016
+              CMD=$1
+              if [ -z "$ROOT_PREFIX" ]; then
+                bash -lc "$CMD"
+              else
+                # feed sudo password via stdin one time for the whole block
+                echo "$SUDO_PASS" | $ROOT_PREFIX bash -lc "$CMD"
+              fi
+            }
 
-            sudo mkdir -p "$DEPLOY_PATH"
-            cd "$DEPLOY_PATH"
+            # Build the privileged deployment script
+            read -r -d '' PRIV_BLOCK <<'EOS'
+              set -euo pipefail
 
-            if [ ! -f docker-compose.yml ]; then
-              echo "docker-compose.yml not found in $DEPLOY_PATH — aborting."; exit 1
-            fi
+              # Ensure docker installed and compose v2 available
+              if ! command -v docker >/dev/null 2>&1; then
+                echo "docker not found on server"; exit 1
+              fi
+              if ! docker compose version >/dev/null 2>&1; then
+                echo "docker compose v2 not found"; exit 1
+              fi
 
-            echo "Current compose services:"
-            sudo docker compose config --services || true
+              # Docker Hub login using a temp file (avoids stdin conflict with sudo -S)
+              umask 077
+              printf '%s' "$DOCKERHUB_TOKEN" > /root/.dhtoken
+              docker login -u "$DOCKERHUB_USERNAME" --password-stdin < /root/.dhtoken
+              rm -f /root/.dhtoken
 
-            # ensure backend network exists (optional)
-            sudo docker network inspect backend >/dev/null 2>&1 || sudo docker network create backend
+              mkdir -p "$DEPLOY_PATH"
+              cd "$DEPLOY_PATH"
 
-            # Update ONLY backend image line
-            sudo sed -i -E "s|(^[[:space:]]*image:[[:space:]]*)${IMAGE_NAME}:[[:alnum:]._-]+|\1${IMAGE_NAME}:${IMAGE_TAG}|g" docker-compose.yml
+              if [ ! -f docker-compose.yml ]; then
+                echo "docker-compose.yml not found in $DEPLOY_PATH — aborting."; exit 1
+              fi
 
-            echo "Compose diff (around image):"
-            grep -n -A2 -B2 -E "image:.*${IMAGE_NAME}" docker-compose.yml || true
+              echo "Current compose services:"
+              docker compose config --services || true
 
-            echo "Pull the new backend image..."
-            sudo docker pull "${IMAGE_NAME}:${IMAGE_TAG}"
+              # ensure backend network exists (optional)
+              docker network inspect backend >/dev/null 2>&1 || docker network create backend
 
-            echo "Waiting for MySQL healthy (max ~90s)..."
-            ATTEMPTS=0
-            until [ "$(sudo docker inspect --format='{{json .State.Health.Status}}' mysql-prod 2>/dev/null | tr -d '\"')" = "healthy" ] || [ $ATTEMPTS -ge 9 ]; do
-              ATTEMPTS=$((ATTEMPTS+1))
-              sleep 10
-            done
+              # Update ONLY backend image line
+              sed -i -E "s|(^[[:space:]]*image:[[:space:]]*)${IMAGE_NAME}:[[:alnum:]._-]+|\1${IMAGE_NAME}:${IMAGE_TAG}|g" docker-compose.yml
 
-            echo "Recreate only backend with the new image..."
-            sudo docker compose pull "${SERVICE_NAME}"
-            sudo docker compose up -d "${SERVICE_NAME}"
+              echo "Compose diff (around image):"
+              grep -n -A2 -B2 -E "image:.*${IMAGE_NAME}" docker-compose.yml || true
 
-            echo "Prune dangling images..."
-            sudo docker image prune -f
+              echo "Pull the new backend image..."
+              docker pull "${IMAGE_NAME}:${IMAGE_TAG}"
 
-            echo "Status:"
-            sudo docker ps --filter "name=${SERVICE_NAME}" || true
-            sudo docker compose ps || true
+              echo "Waiting for MySQL healthy (max ~90s)..."
+              ATTEMPTS=0
+              until [ "$(docker inspect --format='{{json .State.Health.Status}}' mysql-prod 2>/dev/null | tr -d '\"')" = "healthy" ] || [ $ATTEMPTS -ge 9 ]; do
+                ATTEMPTS=$((ATTEMPTS+1))
+                sleep 10
+              done
 
-            echo "Recent backend logs (30 lines):"
-            sudo docker logs --tail=30 "${SERVICE_NAME}" || true
+              echo "Recreate only backend with the new image..."
+              docker compose pull "${SERVICE_NAME}"
+              docker compose up -d "${SERVICE_NAME}"
+
+              echo "Prune dangling images..."
+              docker image prune -f
+
+              echo "Status:"
+              docker ps --filter "name=${SERVICE_NAME}" || true
+              docker compose ps || true
+
+              echo "Recent backend logs (30 lines):"
+              docker logs --tail=30 "${SERVICE_NAME}" || true
+EOS
+
+            # Execute the privileged block (with sudo -S if needed)
+            run_root_block "$PRIV_BLOCK"
