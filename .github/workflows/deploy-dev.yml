@@ -7,8 +7,8 @@ on:
 
 env:
   IMAGE_NAME: freelixlaos/freelix-backend   # Docker Hub repo
-  DEPLOY_PATH: /opt/freelix-backend         # server folder that already has docker-compose.yml
-  SERVICE_NAME: freelix-backend             # compose service/container name for backend
+  DEPLOY_PATH: /opt/freelix-backend         # folder on server with docker-compose.yml
+  SERVICE_NAME: freelix-backend             # compose service/container name
 
 jobs:
   build-and-push:
@@ -80,124 +80,100 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # Fail early if essential secrets are missing
+      # Optional guard: stop early if essential secrets are missing
       - name: Validate required secrets
         if: ${{ secrets.SSH_HOST == '' || secrets.SSH_USER == '' || secrets.SSH_PASSWORD == '' || secrets.DOCKERHUB_USERNAME == '' || secrets.DOCKERHUB_TOKEN == '' }}
         run: |
           echo "::error::Missing required secrets. Set SSH_HOST, SSH_USER, SSH_PASSWORD, DOCKERHUB_USERNAME, DOCKERHUB_TOKEN."
           exit 1
 
-      - name: Deploy via SSH (handles sudo without TTY)
+      - name: Deploy via SSH (non-interactive sudo)
         uses: appleboy/ssh-action@v1.2.0
         env:
           IMAGE_TAG: ${{ needs.build-and-push.outputs.IMAGE_TAG }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}         # used as fallback for sudo
-          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}       # optional; if unset, SSH_PASSWORD is used
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}      # fallback for sudo if SUDO_PASSWORD not set
+          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}    # optional: prefer this for sudo
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           password: ${{ secrets.SSH_PASSWORD }}
-          # Uncomment if you use a non-default SSH port:
-          # port: ${{ secrets.SSH_PORT }}
+          # port: ${{ secrets.SSH_PORT }}   # uncomment if you use a non-default port
           timeout: 60s
           command_timeout: 20m
-          # Pass env vars into the remote shell
+          # Pass env vars to the remote session
           envs: IMAGE_NAME,IMAGE_TAG,DEPLOY_PATH,SERVICE_NAME,DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,SSH_PASSWORD,SUDO_PASSWORD
           script: |
             set -euo pipefail
 
-            # Choose a sudo password: prefer SUDO_PASSWORD, else SSH_PASSWORD
             SUDO_PASS="${SUDO_PASSWORD:-$SSH_PASSWORD}"
 
-            # If we're root, no sudo needed; otherwise require a password for sudo -S
+            # Define a helper that runs commands with sudo if needed (non-interactively)
             if [ "$(id -u)" -eq 0 ]; then
-              echo "[INFO] Running as root on remote host."
-              ROOT_PREFIX=""
+              sudo_cmd() { "$@"; }
             else
               if [ -z "${SUDO_PASS:-}" ]; then
-                echo "::error::This user requires sudo but no sudo password was provided. Set secret SUDO_PASSWORD or run as root / add user to docker group."
+                echo "::error::This user requires sudo but no sudo password provided. Set SUDO_PASSWORD or use a root SSH user or add user to docker group."
                 exit 1
               fi
-              echo "[INFO] Authenticating sudo..."
+              # Validate sudo and keep it alive briefly
               echo "$SUDO_PASS" | sudo -S -v
-              ROOT_PREFIX="sudo -S"
+              sudo_cmd() { echo "$SUDO_PASS" | sudo -S "$@"; }
             fi
 
-            # Helper to run a whole privileged block (either with sudo or directly)
-            run_root_block() {
-              # shellcheck disable=SC2016
-              CMD=$1
-              if [ -z "$ROOT_PREFIX" ]; then
-                bash -lc "$CMD"
-              else
-                # feed sudo password via stdin one time for the whole block
-                echo "$SUDO_PASS" | $ROOT_PREFIX bash -lc "$CMD"
-              fi
-            }
+            # Basic checks
+            if ! sudo_cmd command -v docker >/dev/null 2>&1; then
+              echo "docker not found on server"; exit 1
+            fi
+            if ! sudo_cmd docker compose version >/dev/null 2>&1; then
+              echo "docker compose v2 not found"; exit 1
+            fi
 
-            # Build the privileged deployment script
-            read -r -d '' PRIV_BLOCK <<'EOS'
-              set -euo pipefail
+            # Login to Docker Hub (stdin, non-tty)
+            printf '%s' "$DOCKERHUB_TOKEN" | sudo_cmd docker login -u "$DOCKERHUB_USERNAME" --password-stdin
 
-              # Ensure docker installed and compose v2 available
-              if ! command -v docker >/dev/null 2>&1; then
-                echo "docker not found on server"; exit 1
-              fi
-              if ! docker compose version >/dev/null 2>&1; then
-                echo "docker compose v2 not found"; exit 1
-              fi
+            # Ensure compose folder exists
+            sudo_cmd mkdir -p "$DEPLOY_PATH"
 
-              # Docker Hub login using a temp file (avoids stdin conflict with sudo -S)
-              umask 077
-              printf '%s' "$DOCKERHUB_TOKEN" > /root/.dhtoken
-              docker login -u "$DOCKERHUB_USERNAME" --password-stdin < /root/.dhtoken
-              rm -f /root/.dhtoken
+            # Validate compose file exists
+            if ! sudo_cmd test -f "$DEPLOY_PATH/docker-compose.yml"; then
+              echo "docker-compose.yml not found in $DEPLOY_PATH — aborting."
+              exit 1
+            fi
 
-              mkdir -p "$DEPLOY_PATH"
-              cd "$DEPLOY_PATH"
+            echo "Current compose services:"
+            sudo_cmd docker compose -f "$DEPLOY_PATH/docker-compose.yml" config --services || true
 
-              if [ ! -f docker-compose.yml ]; then
-                echo "docker-compose.yml not found in $DEPLOY_PATH — aborting."; exit 1
-              fi
+            # Ensure network exists (optional)
+            sudo_cmd docker network inspect backend >/dev/null 2>&1 || sudo_cmd docker network create backend
 
-              echo "Current compose services:"
-              docker compose config --services || true
+            # Update ONLY backend image line
+            sudo_cmd sed -i -E "s|(^[[:space:]]*image:[[:space:]]*)${IMAGE_NAME}:[[:alnum:]._-]+|\1${IMAGE_NAME}:${IMAGE_TAG}|g" "$DEPLOY_PATH/docker-compose.yml"
 
-              # ensure backend network exists (optional)
-              docker network inspect backend >/dev/null 2>&1 || docker network create backend
+            echo "Compose diff (around image):"
+            sudo_cmd grep -n -A2 -B2 -E "image:.*${IMAGE_NAME}" "$DEPLOY_PATH/docker-compose.yml" || true
 
-              # Update ONLY backend image line
-              sed -i -E "s|(^[[:space:]]*image:[[:space:]]*)${IMAGE_NAME}:[[:alnum:]._-]+|\1${IMAGE_NAME}:${IMAGE_TAG}|g" docker-compose.yml
+            echo "Pull the new backend image..."
+            sudo_cmd docker pull "${IMAGE_NAME}:${IMAGE_TAG}"
 
-              echo "Compose diff (around image):"
-              grep -n -A2 -B2 -E "image:.*${IMAGE_NAME}" docker-compose.yml || true
+            echo "Waiting for MySQL healthy (max ~90s)..."
+            ATTEMPTS=0
+            until [ "$(sudo_cmd docker inspect --format='{{json .State.Health.Status}}' mysql-prod 2>/dev/null | tr -d '\"')" = "healthy" ] || [ $ATTEMPTS -ge 9 ]; do
+              ATTEMPTS=$((ATTEMPTS+1))
+              sleep 10
+            done
 
-              echo "Pull the new backend image..."
-              docker pull "${IMAGE_NAME}:${IMAGE_TAG}"
+            echo "Recreate only backend with the new image..."
+            sudo_cmd docker compose -f "$DEPLOY_PATH/docker-compose.yml" pull "${SERVICE_NAME}"
+            sudo_cmd docker compose -f "$DEPLOY_PATH/docker-compose.yml" up -d "${SERVICE_NAME}"
 
-              echo "Waiting for MySQL healthy (max ~90s)..."
-              ATTEMPTS=0
-              until [ "$(docker inspect --format='{{json .State.Health.Status}}' mysql-prod 2>/dev/null | tr -d '\"')" = "healthy" ] || [ $ATTEMPTS -ge 9 ]; do
-                ATTEMPTS=$((ATTEMPTS+1))
-                sleep 10
-              done
+            echo "Prune dangling images..."
+            sudo_cmd docker image prune -f
 
-              echo "Recreate only backend with the new image..."
-              docker compose pull "${SERVICE_NAME}"
-              docker compose up -d "${SERVICE_NAME}"
+            echo "Status:"
+            sudo_cmd docker ps --filter "name=${SERVICE_NAME}" || true
+            sudo_cmd docker compose -f "$DEPLOY_PATH/docker-compose.yml" ps || true
 
-              echo "Prune dangling images..."
-              docker image prune -f
-
-              echo "Status:"
-              docker ps --filter "name=${SERVICE_NAME}" || true
-              docker compose ps || true
-
-              echo "Recent backend logs (30 lines):"
-              docker logs --tail=30 "${SERVICE_NAME}" || true
-EOS
-
-            # Execute the privileged block (with sudo -S if needed)
-            run_root_block "$PRIV_BLOCK"
+            echo "Recent backend logs (30 lines):"
+            sudo_cmd docker logs --tail=30 "${SERVICE_NAME}" || true
