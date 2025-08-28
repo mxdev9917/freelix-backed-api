@@ -3,6 +3,7 @@ const apiRoutes = express.Router();
 const multer = require('multer');
 const userController = require('../controllers/apiController/userService');
 const { createProfile } = require('../controllers/apiController/profiles/controller');
+const userControllerV2 = require('../controllers/apiController/users/controller');
 
 // Multer setup
 const storage = multer.memoryStorage(); // keeps file in RAM as buffer
@@ -35,18 +36,17 @@ const upload = multer({ storage });
  *         token:
  *           type: string
  *           description: JWT authentication token
+ *           example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
  *         data:
  *           type: string
  *           description: Encrypted user data
+ *           example: "U2FsdGVkX19X123..."
  *     ErrorResponse:
  *       type: object
  *       properties:
- *         statusCode:
+ *         status:
  *           type: integer
  *           example: 400
- *         error:
- *           type: string
- *           example: Bad Request
  *         message:
  *           type: string
  *           example: Missing required field: phone
@@ -299,38 +299,12 @@ apiRoutes.delete('/user/:id', userController.deleteUser);
  *     responses:
  *       200:
  *         description: User updated successfully
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                   example: true
- *                 message:
- *                   type: string
- *                   example: "phone updated successfully"
- *                 phone:
- *                   type: string
- *                   example: "+1234567890"
  *       400:
  *         description: Missing fields or invalid field name
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/ErrorResponse'
  *       404:
  *         description: User not found
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/ErrorResponse'
  *       409:
  *         description: Phone number already exists
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/ErrorResponse'
  *       500:
  *         description: Internal server error
  */
@@ -356,7 +330,7 @@ apiRoutes.patch('/user', userController.updateUser);
  *             schema:
  *               $ref: '#/components/schemas/AuthResponse'
  *       400:
- *         description: Missing fields
+ *         description: Missing fields or bad request
  *         content:
  *           application/json:
  *             schema:
@@ -381,8 +355,12 @@ apiRoutes.patch('/user', userController.updateUser);
  *               $ref: '#/components/schemas/ErrorResponse'
  *       500:
  *         description: Internal server error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
  */
-apiRoutes.post('/user/sign-in', userController.signInUser);
+apiRoutes.post('/user/sign-in', userControllerV2.signInUser);
 
 /**
  * @swagger
@@ -401,29 +379,10 @@ apiRoutes.post('/user/sign-in', userController.signInUser);
  *     responses:
  *       200:
  *         description: User name updated successfully
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                   example: true
- *                 message:
- *                   type: string
- *                   example: "User updated successfully"
  *       400:
  *         description: Missing required fields
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/ErrorResponse'
  *       404:
  *         description: User not found
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/ErrorResponse'
  *       500:
  *         description: Internal server error
  */
@@ -446,32 +405,10 @@ apiRoutes.patch('/user/name', userController.updateUserName);
  *     responses:
  *       200:
  *         description: User image updated successfully
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                   example: true
- *                 message:
- *                   type: string
- *                   example: "User image updated successfully"
- *                 filename:
- *                   type: string
- *                   example: "avatar_8b4a0e08.png"
  *       400:
  *         description: No file uploaded or missing user ID
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/ErrorResponse'
  *       404:
  *         description: User not found
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/ErrorResponse'
  *       500:
  *         description: Internal server error
  */
@@ -497,43 +434,10 @@ apiRoutes.patch('/user/img', upload.single('file'), userController.updateUserIma
  *     responses:
  *       201:
  *         description: Profile created/updated successfully
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                   example: true
- *                 message:
- *                   type: string
- *                   example: "Profile saved"
- *                 profileId:
- *                   type: string
- *                   example: "prf_01J8Y0Z8R8Q0X2J4"
- *                 files:
- *                   type: array
- *                   items:
- *                     type: object
- *                     properties:
- *                       field:
- *                         type: string
- *                         example: passport_img
- *                       filename:
- *                         type: string
- *                         example: "passport.jpg"
  *       400:
  *         description: Invalid payload
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/ErrorResponse'
  *       401:
  *         description: Unauthorized
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/ErrorResponse'
  *       500:
  *         description: Internal server error
  */
