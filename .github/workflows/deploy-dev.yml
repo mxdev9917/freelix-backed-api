@@ -90,7 +90,7 @@ jobs:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           password: ${{ secrets.SSH_PASSWORD }}
-          # omit port -> defaults to 22; add `port: ${{ secrets.SSH_PORT }}` if you set it
+          port: ${{ secrets.SSH_PORT }}
           timeout: 60s
           command_timeout: 20m
           # pass env vars to the remote shell
