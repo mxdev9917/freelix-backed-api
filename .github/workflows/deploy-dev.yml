@@ -1,8 +1,8 @@
-name: Build & Deploy (backend only, CLI Compose)
+name: Build & Deploy (immutable tag via env, backend only)
 
 on:
   push:
-    branches: ["develop"]   # เปลี่ยนสาขาตามที่ใช้งาน
+    branches: ["develop"]        # เปลี่ยนตามที่ใช้
   workflow_dispatch:
 
 concurrency:
@@ -10,10 +10,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE_NAME: freelixlaos/freelix-backend    # ชื่อ image บน Docker Hub
-  DEPLOY_PATH: /opt/freelix-backend           # โฟลเดอร์ที่มี docker-compose.yml บนเซิร์ฟเวอร์
-  SERVICE_NAME: backend                       # ชื่อ service ใน compose (ของ backend)
-  CONTAINER_NAME: freelix-backend             # ชื่อคอนเทนเนอร์ (เช็คให้ตรงกับ compose)
+  IMAGE_NAME: freelixlaos/freelix-backend
+  DEPLOY_PATH: /opt/freelix-backend
+  SERVICE_NAME: backend
+  CONTAINER_NAME: freelix-backend
 
 jobs:
   build-and-push:
@@ -25,16 +25,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Detect version (from package.json, fallback latest)
+      - name: Detect version (from package.json, fallback to latest)
         id: ver
         shell: bash
         run: |
           set -euo pipefail
-          TAG=""
           if [ -f package.json ]; then
             TAG=$(node -e "try{console.log(require('./package.json').version||'')}catch(e){console.log('')}")
           fi
-          if [ -z "$TAG" ]; then
+          if [ -z "${TAG:-}" ]; then
             echo "IMAGE_TAG=latest" >> "$GITHUB_OUTPUT"
             echo "Using tag: latest"
           else
@@ -69,13 +68,13 @@ jobs:
           cache-to: type=gha,mode=max
 
   deploy:
-    name: Deploy on server (update backend only)
+    name: Deploy on server (no file edits)
     needs: build-and-push
     runs-on: ubuntu-latest
     env:
       IMAGE_TAG: ${{ needs.build-and-push.outputs.IMAGE_TAG }}
     steps:
-      - name: SSH & Deploy
+      - name: SSH & Deploy (pass IMAGE_TAG to compose)
         uses: appleboy/ssh-action@v1.2.0
         env:
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
@@ -83,26 +82,24 @@ jobs:
           SERVICE_NAME: ${{ env.SERVICE_NAME }}
           CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
           IMAGE_TAG: ${{ env.IMAGE_TAG }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
-          password: ${{ secrets.SSH_PASSWORD }}         # ถ้าใช้ key ให้เปลี่ยนเป็น key / passphrase แทน
-          port: ${{ secrets.SSH_PORT }}                 # ถ้าเป็น 22 จะเว้นว่างไว้ได้
+          # ใช้อย่างใดอย่างหนึ่ง: password หรือ private key
+          password: ${{ secrets.SSH_PASSWORD }}
+          # key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT }}
           timeout: 60s
           command_timeout: 20m
-          envs: IMAGE_NAME,IMAGE_TAG,DEPLOY_PATH,SERVICE_NAME,CONTAINER_NAME
+          envs: IMAGE_NAME,IMAGE_TAG,DEPLOY_PATH,SERVICE_NAME,CONTAINER_NAME,DOCKERHUB_USERNAME,DOCKERHUB_TOKEN
           script: |
             set -euo pipefail
+            cd "$DEPLOY_PATH"
 
-            # ===== Decide sudo for docker & filesystem =====
+            # ----- pick docker compose binary & sudo if required -----
             if docker info >/dev/null 2>&1; then SUDO=""; else SUDO="sudo"; fi
-            PARENT="$(dirname "$DEPLOY_PATH")"
-            if [ ! -d "$DEPLOY_PATH" ]; then
-              [ -w "$PARENT" ] || SUDO="sudo"
-              $SUDO mkdir -p "$DEPLOY_PATH"
-            fi
-
-            # ===== Check docker compose command =====
             if $SUDO docker compose version >/dev/null 2>&1; then
               DC="$SUDO docker compose"
             elif $SUDO docker-compose version >/dev/null 2>&1; then
@@ -112,33 +109,23 @@ jobs:
             fi
 
             echo "Login Docker Hub..."
-            echo "${{ secrets.DOCKERHUB_TOKEN }}" | $SUDO docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+            echo "$DOCKERHUB_TOKEN" | $SUDO docker login -u "$DOCKERHUB_USERNAME" --password-stdin
 
-            # ===== Ensure compose file exists =====
-            if [ ! -f "$DEPLOY_PATH/docker-compose.yml" ]; then
-              echo "ERROR: $DEPLOY_PATH/docker-compose.yml not found"; exit 1
-            fi
+            test -f docker-compose.yml || { echo "docker-compose.yml not found in $DEPLOY_PATH"; exit 1; }
+            test -f .env || { echo ".env not found in $DEPLOY_PATH"; exit 1; }
 
-            echo "Current services:"
-            $DC -f "$DEPLOY_PATH/docker-compose.yml" config --services || true
+            echo "Services available:"
+            $DC -f docker-compose.yml config --services || true
 
-            # ===== Update image tag in compose =====
-            echo "Update image tag to ${IMAGE_TAG}"
-            sed -i -E "s|(^[[:space:]]*image:[[:space:]]*${IMAGE_NAME}:)[[:alnum:]._-]+|\1${IMAGE_TAG}|g" "$DEPLOY_PATH/docker-compose.yml"
+            echo "Deploying ${IMAGE_NAME}:${IMAGE_TAG} (immutable, no file edits)"
+            IMAGE_TAG="${IMAGE_TAG}" $DC --env-file .env pull "$SERVICE_NAME"
+            IMAGE_TAG="${IMAGE_TAG}" $DC --env-file .env up -d "$SERVICE_NAME"
 
-            echo "Compose diff (image lines):"
-            grep -n -A1 -B1 -E "image:.*${IMAGE_NAME}" "$DEPLOY_PATH/docker-compose.yml" || true
-
-            # ===== Pull new image & recreate only backend =====
-            $SUDO docker pull "${IMAGE_NAME}:${IMAGE_TAG}"
-            $DC -f "$DEPLOY_PATH/docker-compose.yml" --env-file "$DEPLOY_PATH/.env" pull "$SERVICE_NAME"
-            $DC -f "$DEPLOY_PATH/docker-compose.yml" --env-file "$DEPLOY_PATH/.env" up -d "$SERVICE_NAME"
-
-            # ===== Show status & last logs =====
+            echo "Status:"
+            $DC -f docker-compose.yml ps || true
             $SUDO docker ps --filter "name=${CONTAINER_NAME}" || true
-            $DC -f "$DEPLOY_PATH/docker-compose.yml" ps || true
             echo "Recent logs:"
-            $SUDO docker logs --tail=50 "${CONTAINER_NAME}" || true
+            $SUDO docker logs --tail=80 "${CONTAINER_NAME}" || true
 
-            # Optional: prune dangling images
+            # Optional: cleanup
             $SUDO docker image prune -f || true
